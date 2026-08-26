@@ -105,3 +105,19 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_interpose(void)
+{
+  int mask;
+  char path[MAXPATH];
+  // 使用 argint 获取第一个整数参数 (mask)
+  argint(0, &mask);
+  argstr(1, path, MAXPATH);
+  // 注意：此作业暂不处理第二个路径参数，但可以用 argstr 接收或忽略
+
+  // 将掩码存入当前进程的结构体中
+  myproc()->sandbox_mask = mask;
+  safestrcpy(myproc()->allowed_path, path, MAXPATH);
+  return 0;
+}

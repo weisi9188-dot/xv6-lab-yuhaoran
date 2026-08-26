@@ -111,6 +111,8 @@ allocproc(void)
 {
   struct proc *p;
 
+
+
   for(p = proc; p < &proc[NPROC]; p++) {
     acquire(&p->lock);
     if(p->state == UNUSED) {
@@ -124,6 +126,7 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->sandbox_mask = 0; // 系统调用掩码默认为0，代表默认不限制
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -288,6 +291,9 @@ kfork(void)
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
+
+  np->sandbox_mask = p->sandbox_mask;//我修改的地方
+  safestrcpy(np->allowed_path, p->allowed_path, MAXPATH);//也是我修改的地方
 
   release(&np->lock);
 

@@ -7,6 +7,7 @@
 #include "syscall.h"
 #include "defs.h"
 
+
 // Fetch the uint64 at addr from the current process.
 int
 fetchaddr(uint64 addr, uint64 *ip)
@@ -101,6 +102,8 @@ extern uint64 sys_unlink(void);
 extern uint64 sys_link(void);
 extern uint64 sys_mkdir(void);
 extern uint64 sys_close(void);
+extern uint64 sys_interpose(void);
+
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -126,22 +129,47 @@ static uint64 (*syscalls[])(void) = {
 [SYS_link]    sys_link,
 [SYS_mkdir]   sys_mkdir,
 [SYS_close]   sys_close,
+[SYS_interpose]   sys_interpose,
 };
 
 void
 syscall(void)
 {
   int num;
-  struct proc *p = myproc();
+  struct proc* p = myproc();
 
-  num = p->trapframe->a7;
-  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
-    // Use num to lookup the system call function for num, call it,
-    // and store its return value in p->trapframe->a0
+  num = p->trapframe->a7; // 获取系统调用号
+  if (num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    // 检查是否被沙箱禁止
+    if (p->sandbox_mask & (1 << num)) {
+      // ---- 新增路径检查 ----
+      // 如果是 open 或 exec，检查路径是否匹配允许的路径
+      if ((num == SYS_open || num == SYS_exec)) {
+        char path[MAXPATH];
+        // 从用户空间读取路径参数（索引0）
+        if (fetchstr((uint64)p->trapframe->a0, path, MAXPATH) >= 0) {
+          // 比较路径（使用 strncmp 或 strcmp）
+          if (strncmp(path, p->allowed_path, MAXPATH) == 0) {
+            // 路径匹配，放行！调用真正的系统调用
+            p->trapframe->a0 = syscalls[num]();
+            return;
+          }
+        }
+      }
+      // 如果不匹配，或者不是 open/exec，则拒绝
+      p->trapframe->a0 = -1;
+      return;
+    }
+
+    // 正常执行
     p->trapframe->a0 = syscalls[num]();
-  } else {
-    printf("%d %s: unknown sys call %d\n",
-            p->pid, p->name, num);
+  }
+  else {
+    printf("%d %s: unknown sys call %d\n", p->pid, p->name, num);
     p->trapframe->a0 = -1;
   }
 }
+
+
+
+
