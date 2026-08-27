@@ -16,6 +16,11 @@ r_mhartid()
 #define MSTATUS_MPP_S (1L << 11)
 #define MSTATUS_MPP_U (0L << 11)
 
+// 在现有宏之后添加
+#define SUPER_SIZE (2 * 1024 * 1024)   // 2MB 超级页大小
+#define PTE_S (1L << 8)                // 软件位，标记该 PTE 为超级页
+#define PTE_LEAF(pte) ((pte) & (PTE_R | PTE_W | PTE_X))
+
 static inline uint64
 r_mstatus()
 {
@@ -377,9 +382,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
 
 
 
-#if defined(LAB_MMAP) || defined(LAB_PGTBL) || defined(LAB_COW)
-#define PTE_LEAF(pte) (((pte) & PTE_R) | ((pte) & PTE_W) | ((pte) & PTE_X))
-#endif
+
 
 // shift a physical address to the right place for a PTE.
 #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)

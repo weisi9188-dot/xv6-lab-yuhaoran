@@ -132,6 +132,13 @@ found:
     return 0;
   }
 
+  if ((p->usyscall = (struct usyscall*)kalloc()) == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+  p->usyscall->pid = p->pid;   // 存入当前进程 PID
+
   // An empty user page table.
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
@@ -139,7 +146,6 @@ found:
     release(&p->lock);
     return 0;
   }
-
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -158,6 +164,11 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
+
+  if (p->usyscall)          // 新增
+    kfree((void*)p->usyscall);
+  p->usyscall = 0;
+
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
@@ -202,6 +213,15 @@ proc_pagetable(struct proc *p)
     return 0;
   }
 
+  // 【新增】映射 USYSCALL 页
+  if (mappages(pagetable, USYSCALL, PGSIZE,
+    (uint64)(p->usyscall), PTE_R | PTE_U) < 0) {
+    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+    uvmunmap(pagetable, TRAPFRAME, 1, 0);
+    uvmfree(pagetable, 0);
+    return 0;
+  }
+
   return pagetable;
 }
 
@@ -212,6 +232,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
+  uvmunmap(pagetable, USYSCALL, 1, 0);   // 新增
   uvmfree(pagetable, sz);
 }
 
@@ -237,14 +258,15 @@ int
 growproc(int n)
 {
   uint64 sz;
-  struct proc *p = myproc();
+  struct proc* p = myproc();
 
   sz = p->sz;
-  if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W)) == 0) {
+  if (n > 0) {
+    if ((sz = uvmalloc(p->pagetable, sz, sz + n, PTE_W | PTE_R | PTE_U)) == 0) {
       return -1;
     }
-  } else if(n < 0){
+  }
+  else if (n < 0) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
