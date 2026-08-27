@@ -68,6 +68,7 @@ sys_pause(void)
   int n;
   uint ticks0;
 
+  backtrace();
   argint(0, &n);
   if(n < 0)
     n = 0;
@@ -104,4 +105,34 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+// store the alarm interval and handler address in the process.
+uint64
+sys_sigalarm(void)
+{
+  int n;
+  uint64 handler;
+  struct proc *p = myproc();
+
+  argint(0, &n);
+  argaddr(1, &handler);
+
+  p->alarm_interval = n;
+  p->alarm_handler = handler;
+  p->alarm_ticks = 0;
+  p->alarm_ongoing = 0;
+  return 0;
+}
+
+// restore the trapframe saved when the alarm fired, and return the
+// interrupted a0 so the syscall return path preserves it.
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+
+  *p->trapframe = *p->alarm_trapframe;
+  p->alarm_ongoing = 0;
+  return p->trapframe->a0;
 }
