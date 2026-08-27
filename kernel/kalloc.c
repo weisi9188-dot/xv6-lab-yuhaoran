@@ -23,6 +23,16 @@ struct {
   struct run *freelist;
 } kmem;
 
+// reference counts for copy-on-write pages. Each physical page is
+// counted by the number of user page tables that reference it.
+int refcount[(PHYSTOP - KERNBASE) / PGSIZE];
+
+static inline int
+refidx(uint64 pa)
+{
+  return (pa - KERNBASE) / PGSIZE;
+}
+
 void
 kinit()
 {
@@ -39,6 +49,26 @@ freerange(void *pa_start, void *pa_end)
     kfree(p);
 }
 
+// increment the reference count of a physical page (fork shares it).
+void
+krefinc(uint64 pa)
+{
+  acquire(&kmem.lock);
+  refcount[refidx(pa)]++;
+  release(&kmem.lock);
+}
+
+// return the reference count of a physical page.
+int
+krefget(uint64 pa)
+{
+  int n;
+  acquire(&kmem.lock);
+  n = refcount[refidx(pa)];
+  release(&kmem.lock);
+  return n;
+}
+
 // Free the page of physical memory pointed at by pa,
 // which normally should have been returned by a
 // call to kalloc().  (The exception is when
@@ -47,9 +77,22 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  int idx;
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  // decrement the reference count; only actually free when it hits zero.
+  idx = refidx((uint64)pa);
+
+  acquire(&kmem.lock);
+  if(refcount[idx] > 1){
+    refcount[idx]--;
+    release(&kmem.lock);
+    return;
+  }
+  refcount[idx] = 0;
+  release(&kmem.lock);
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +119,9 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
+    refcount[refidx((uint64)r)] = 1;
     memset((char*)r, 5, PGSIZE); // fill with junk
+  }
   return (void*)r;
 }

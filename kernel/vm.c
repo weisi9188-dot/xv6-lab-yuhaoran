@@ -299,7 +299,6 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -308,13 +307,19 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       continue;   // physical page hasn't been allocated
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    // If the page is writable, make it copy-on-write: clear PTE_W in
+    // both page tables and mark it PTE_COW. Read-only pages (e.g. text)
+    // are shared as-is.
+    if(flags & PTE_W){
+      *pte = (*pte & ~PTE_W) | PTE_COW;
+      flags = (flags & ~PTE_W) | PTE_COW;
     }
+
+    // Map the same physical page into the child.
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+    krefinc(pa);
   }
   return 0;
 
@@ -350,6 +355,13 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     if(va0 >= MAXVA)
       return -1;
   
+    // If the target page is copy-on-write, fault it in first.
+    pte = walk(pagetable, va0, 0);
+    if(pte != 0 && (*pte & PTE_COW)){
+      if(vmfault(pagetable, va0, 0) == 0)
+        return -1;
+    }
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
       if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
@@ -452,20 +464,44 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
-  uint64 mem;
+  uint64 mem, pa, flags;
   struct proc *p = myproc();
+  pte_t *pte;
 
   if (va >= p->sz)
     return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
-    return 0;
+
+  pte = walk(pagetable, va, 0);
+
+  // Copy-on-write: a write fault on a COW page.
+  if(pte != 0 && (*pte & PTE_V) && (*pte & PTE_COW) && read == 0){
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte);
+    if(krefget(pa) == 1){
+      // last reference: just make it writable again.
+      *pte = (*pte & ~PTE_COW) | PTE_W;
+      return pa;
+    }
+    // shared by others: allocate a private copy.
+    if((mem = (uint64)kalloc()) == 0)
+      return 0;
+    memmove((void *)mem, (void *)pa, PGSIZE);
+    *pte = PA2PTE(mem) | ((flags & ~PTE_COW) | PTE_W);
+    kfree((void *)pa);  // drop our reference to the old page
+    return mem;
   }
+
+  // Already mapped (e.g. a write to a read-only page, or a read fault).
+  if(pte != 0 && (*pte & PTE_V))
+    return 0;
+
+  // Not mapped: lazily allocate a zeroed page.
   mem = (uint64) kalloc();
   if(mem == 0)
     return 0;
   memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+  if (mappages(pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
     kfree((void *)mem);
     return 0;
   }
