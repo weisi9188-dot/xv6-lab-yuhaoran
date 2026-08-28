@@ -105,7 +105,36 @@ e1000_transmit(char *buf, int len)
   // so that the caller knows to free buf.
   //
 
-  
+  acquire(&e1000_lock);
+
+  // Ask the e1000 for the TX ring index at which it's
+  // expecting the next packet.
+  int idx = regs[E1000_TDT];
+
+  // If E1000_TXD_STAT_DD is not set in the descriptor indexed by
+  // E1000_TDT, the e1000 hasn't finished the corresponding previous
+  // transmission request, so the ring is full.
+  if((tx_ring[idx].status & E1000_TXD_STAT_DD) == 0){
+    release(&e1000_lock);
+    return -1;
+  }
+
+  // Free the last buffer that was transmitted from this descriptor
+  // (if there was one); the e1000 has finished with it (DD was set).
+  if(tx_ring[idx].addr != 0)
+    kfree((char *)tx_ring[idx].addr);
+
+  // Fill in the descriptor: buffer address, length, and the
+  // end-of-packet / report-status command flags.
+  tx_ring[idx].addr = (uint64)buf;
+  tx_ring[idx].length = (uint16)len;
+  tx_ring[idx].cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  tx_ring[idx].status = 0;
+
+  // Update the ring position.
+  regs[E1000_TDT] = (idx + 1) % TX_RING_SIZE;
+
+  release(&e1000_lock);
   return 0;
 }
 
@@ -119,6 +148,41 @@ e1000_recv(void)
   // Create and deliver a buf for each packet (using net_rx()).
   //
 
+  acquire(&e1000_lock);
+
+  while(1){
+    // Ask the e1000 for the ring index at which the next waiting
+    // received packet (if any) is located.
+    int idx = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+
+    // Check if a new packet is available.
+    if((rx_ring[idx].status & E1000_RXD_STAT_DD) == 0)
+      break;
+
+    // The packet's buffer and its length.
+    char *buf = (char *)rx_ring[idx].addr;
+    int len = rx_ring[idx].length;
+
+    // Allocate a fresh buffer to replace the one being handed off.
+    char *newbuf = kalloc();
+    if(newbuf == 0)
+      panic("e1000_recv");
+
+    rx_ring[idx].addr = (uint64)newbuf;
+    rx_ring[idx].status = 0;
+
+    // Update the tail to the index of the last descriptor processed.
+    regs[E1000_RDT] = idx;
+
+    // Deliver the packet to the network stack. net_rx() may transmit a
+    // reply (e.g. arp_rx() calls e1000_transmit()), which acquires
+    // e1000_lock, so drop the lock around net_rx().
+    release(&e1000_lock);
+    net_rx(buf, len);
+    acquire(&e1000_lock);
+  }
+
+  release(&e1000_lock);
 }
 
 void

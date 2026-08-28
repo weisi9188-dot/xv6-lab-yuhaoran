@@ -19,10 +19,73 @@ static uint8 host_mac[ETHADDR_LEN] = { 0x52, 0x55, 0x0a, 0x00, 0x02, 0x02 };
 
 static struct spinlock netlock;
 
+// maximum number of UDP packets queued for any one bound port.
+#define MAX_QUEUE 16
+
+// size of the hash table of bound ports.
+#define NPORT 64
+
+// a UDP packet waiting to be read by recv().
+struct net_pkt {
+  struct net_pkt *next;
+  char *buf;         // the frame buffer, freed after the payload is copied out
+  char *payload;     // pointer to the UDP payload within buf
+  uint16 len;        // length of the payload in bytes
+  uint32 src_ip;     // source IP address, host byte order
+  uint16 src_port;   // source UDP port, host byte order
+};
+
+// a bound UDP port and the queue of packets waiting for recv().
+struct net_port {
+  int port;              // the port number, or -1 if this slot is free
+  struct net_pkt *head;  // oldest queued packet
+  struct net_pkt *tail;  // newest queued packet
+  int count;             // number of queued packets (0 .. MAX_QUEUE)
+};
+
+static struct net_port port_tbl[NPORT];
+
+// find the slot for a port, or 0 if it isn't bound.
+static struct net_port *
+port_lookup(int port)
+{
+  struct net_port *pp;
+
+  for(int i = 0; i < NPORT; i++){
+    pp = &port_tbl[(port + i) % NPORT];
+    if(pp->port == port)
+      return pp;
+    if(pp->port == -1)
+      return 0;
+  }
+  return 0;
+}
+
+// find the slot for a port, allocating one if needed; 0 if the table is full.
+static struct net_port *
+port_alloc(int port)
+{
+  struct net_port *pp;
+
+  if((pp = port_lookup(port)) != 0)
+    return pp;
+  for(int i = 0; i < NPORT; i++){
+    pp = &port_tbl[(port + i) % NPORT];
+    if(pp->port == -1){
+      pp->port = port;
+      return pp;
+    }
+  }
+  return 0;
+}
+
 void
 netinit(void)
 {
   initlock(&netlock, "netlock");
+
+  for(int i = 0; i < NPORT; i++)
+    port_tbl[i].port = -1;
 }
 
 
@@ -34,11 +97,19 @@ netinit(void)
 uint64
 sys_bind(void)
 {
-  //
-  // Your code here.
-  //
+  int port;
 
-  return -1;
+  argint(0, &port);
+  if(port < 0 || port > 65535)
+    return -1;
+
+  acquire(&netlock);
+  if(port_alloc(port) == 0){
+    release(&netlock);
+    return -1;
+  }
+  release(&netlock);
+  return 0;
 }
 
 //
@@ -49,10 +120,35 @@ sys_bind(void)
 uint64
 sys_unbind(void)
 {
-  //
-  // Optional: Your code here.
-  //
+  int port;
+  struct net_port *pp;
+  struct net_pkt *pkt;
+  struct net_pkt *next;
 
+  argint(0, &port);
+
+  acquire(&netlock);
+  pp = port_lookup(port);
+  if(pp == 0){
+    release(&netlock);
+    return -1;
+  }
+
+  // free any packets still queued for this port.
+  pkt = pp->head;
+  while(pkt){
+    next = pkt->next;
+    kfree(pkt->buf);
+    kfree(pkt);
+    pkt = next;
+  }
+
+  pp->head = 0;
+  pp->tail = 0;
+  pp->count = 0;
+  pp->port = -1;
+
+  release(&netlock);
   return 0;
 }
 
@@ -74,10 +170,70 @@ sys_unbind(void)
 uint64
 sys_recv(void)
 {
-  //
-  // Your code here.
-  //
-  return -1;
+  int dport;
+  uint64 src_addr, sport_addr, buf_addr;
+  int maxlen;
+  struct proc *p = myproc();
+  struct net_port *pp;
+  struct net_pkt *pkt;
+  uint32 src_ip;
+  uint16 src_port;
+  int n;
+
+  argint(0, &dport);
+  argaddr(1, &src_addr);
+  argaddr(2, &sport_addr);
+  argaddr(3, &buf_addr);
+  argint(4, &maxlen);
+
+  if(dport < 0 || dport > 65535)
+    return -1;
+
+  acquire(&netlock);
+
+  pp = port_lookup(dport);
+  if(pp == 0){
+    release(&netlock);
+    return -1;
+  }
+
+  // wait for a packet addressed to dport.
+  while(pp->count == 0){
+    if(p->killed){
+      release(&netlock);
+      return -1;
+    }
+    sleep(pp, &netlock);
+  }
+
+  // remove the oldest packet from the queue.
+  pkt = pp->head;
+  pp->head = pkt->next;
+  if(pp->head == 0)
+    pp->tail = 0;
+  pp->count--;
+
+  release(&netlock);
+
+  // copy the payload and the source metadata to the caller.
+  n = pkt->len;
+  if(n > maxlen)
+    n = maxlen;
+  src_ip = pkt->src_ip;
+  src_port = pkt->src_port;
+
+  if(copyout(p->pagetable, buf_addr, pkt->payload, n) < 0 ||
+     copyout(p->pagetable, src_addr, (char *)&src_ip, sizeof(src_ip)) < 0 ||
+     copyout(p->pagetable, sport_addr, (char *)&src_port, sizeof(src_port)) < 0){
+    kfree(pkt->buf);
+    kfree(pkt);
+    return -1;
+  }
+
+  kfree(pkt->buf);
+  kfree(pkt);
+
+  return n;
 }
 
 // This code is lifted from FreeBSD's ping.c, and is copyright by the Regents
@@ -188,10 +344,68 @@ ip_rx(char *buf, int len)
     printf("ip_rx: received an IP packet\n");
   seen_ip = 1;
 
-  //
-  // Your code here.
-  //
-  
+  struct eth *eth = (struct eth *)buf;
+  struct ip *ip = (struct ip *)(eth + 1);
+  struct udp *udp = (struct udp *)(ip + 1);
+  struct net_port *pp;
+  struct net_pkt *pkt;
+  int dport;
+  int payload_len;
+
+  // we only handle UDP packets; drop anything else.
+  if(ip->ip_p != IPPROTO_UDP){
+    kfree(buf);
+    return;
+  }
+
+  dport = ntohs(udp->dport);
+
+  acquire(&netlock);
+
+  pp = port_lookup(dport);
+  if(pp == 0){
+    // no one is listening on this port; discard the packet.
+    release(&netlock);
+    kfree(buf);
+    return;
+  }
+
+  if(pp->count >= MAX_QUEUE){
+    // the queue for this port is full, so drop this packet. this does
+    // not affect packets arriving for other ports.
+    release(&netlock);
+    kfree(buf);
+    return;
+  }
+
+  payload_len = ntohs(udp->ulen) - sizeof(struct udp);
+  if(payload_len < 0)
+    payload_len = 0;
+
+  pkt = kalloc();
+  if(pkt == 0){
+    release(&netlock);
+    kfree(buf);
+    return;
+  }
+
+  pkt->next = 0;
+  pkt->buf = buf;
+  pkt->payload = (char *)(udp + 1);
+  pkt->len = payload_len;
+  pkt->src_ip = ntohl(ip->ip_src);
+  pkt->src_port = ntohs(udp->sport);
+
+  if(pp->tail)
+    pp->tail->next = pkt;
+  else
+    pp->head = pkt;
+  pp->tail = pkt;
+  pp->count++;
+
+  wakeup(pp);
+
+  release(&netlock);
 }
 
 //
