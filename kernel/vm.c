@@ -7,6 +7,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "fcntl.h"
+#include "file.h"
 
 /*
  * the kernel's page table.
@@ -455,12 +458,50 @@ vmfault(pagetable_t pagetable, uint64 va, int read)
   uint64 mem;
   struct proc *p = myproc();
 
+  if(va >= MAXVA)
+    return 0;
+
+  va = PGROUNDDOWN(va);
+  if(ismapped(pagetable, va))
+    return 0;
+
+  // Handle a page fault in an mmap'd region (which lies above p->sz).
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vmas[i];
+    if(v->used && va >= v->addr && va < v->addr + v->len){
+      // A store fault to a read-only mapping is an access violation.
+      if(read == 0 && (v->prot & PROT_WRITE) == 0)
+        return 0;
+
+      int perm = PTE_U;
+      if(v->prot & PROT_READ)
+        perm |= PTE_R;
+      if(v->prot & PROT_WRITE)
+        perm |= PTE_W;
+
+      mem = (uint64) kalloc();
+      if(mem == 0)
+        return 0;
+      memset((void *) mem, 0, PGSIZE);
+
+      // Read the relevant file page into the fresh page.
+      struct inode *ip = v->f->ip;
+      uint64 off = v->offset + (va - v->addr);
+      ilock(ip);
+      readi(ip, 0, mem, off, PGSIZE);
+      iunlock(ip);
+
+      if (mappages(p->pagetable, va, PGSIZE, mem, perm) != 0) {
+        kfree((void *)mem);
+        return 0;
+      }
+      return mem;
+    }
+  }
+
+  // Lazy sbrk allocation.
   if (va >= p->sz)
     return 0;
-  va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
-    return 0;
-  }
   mem = (uint64) kalloc();
   if(mem == 0)
     return 0;

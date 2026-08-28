@@ -371,6 +371,71 @@ sys_open(void)
 }
 
 uint64
+sys_mmap(void)
+{
+  uint64 addr, len, offset;
+  int prot, flags;
+  struct file *f;
+  struct proc *p = myproc();
+  struct vma *v;
+  int i;
+
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  if(argfd(4, 0, &f) < 0)
+    return (uint64)-1;
+  argaddr(5, &offset);
+
+  if(addr != 0 || offset != 0 || len == 0)
+    return (uint64)-1;
+
+  // Can't MAP_SHARED a writable mapping of a read-only file.
+  if((prot & PROT_WRITE) && (flags & MAP_SHARED) && !f->writable)
+    return (uint64)-1;
+
+  len = PGROUNDUP(len);
+
+  // Find a free VMA slot.
+  for(i = 0; i < NVMA; i++){
+    if(p->vmas[i].used == 0){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+  if(i == NVMA)
+    return (uint64)-1;
+
+  v->used = 1;
+  v->addr = p->mmap_bottom - len;
+  v->len = len;
+  v->offset = offset;
+  v->prot = prot;
+  v->flags = flags;
+  v->f = f;
+  filedup(f);
+
+  p->mmap_bottom -= len;
+
+  return v->addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, len;
+
+  argaddr(0, &addr);
+  argaddr(1, &len);
+
+  if(len == 0)
+    return 0;
+
+  return vmaunmap(myproc(), addr, len);
+}
+
+uint64
 sys_mkdir(void)
 {
   char path[MAXPATH];

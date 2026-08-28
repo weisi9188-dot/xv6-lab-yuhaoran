@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "fcntl.h"
+#include "sleeplock.h"
+#include "file.h"
 
 struct cpu cpus[NCPU];
 
@@ -124,6 +128,10 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+
+  for(int i = 0; i < NVMA; i++)
+    p->vmas[i].used = 0;
+  p->mmap_bottom = TRAPFRAME;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -251,6 +259,65 @@ growproc(int n)
   return 0;
 }
 
+// Unmap the mmap'd region [addr, addr+len). If the region is MAP_SHARED,
+// write back its pages (clamped to the file's size) to the file. Then
+// unmap and free the physical pages and adjust or free the VMA.
+// Returns 0 on success, -1 if addr is not in a mapped region.
+int
+vmaunmap(struct proc *p, uint64 addr, uint64 len)
+{
+  struct vma *v;
+  int i;
+
+  for(i = 0; i < NVMA; i++){
+    v = &p->vmas[i];
+    if(v->used && addr >= v->addr && addr < v->addr + v->len)
+      break;
+  }
+  if(i == NVMA)
+    return -1;
+
+  // Write back MAP_SHARED pages.
+  if(v->flags & MAP_SHARED){
+    struct inode *ip = v->f->ip;
+    int maxsz;
+    begin_op();
+    ilock(ip);
+    maxsz = ip->size;
+    for(uint64 a = addr; a < addr + len; a += PGSIZE){
+      uint64 off = v->offset + (a - v->addr);
+      if(off >= maxsz)
+        break;
+      uint64 pa = walkaddr(p->pagetable, a);
+      if(pa == 0)
+        continue;
+      int n = PGSIZE;
+      if(off + n > maxsz)
+        n = maxsz - off;
+      writei(ip, 0, (uint64)pa, off, n);
+    }
+    iunlock(ip);
+    end_op();
+  }
+
+  // Unmap and free the physical pages.
+  uvmunmap(p->pagetable, PGROUNDDOWN(addr), PGROUNDUP(len)/PGSIZE, 1);
+
+  // Adjust or free the VMA.
+  if(addr == v->addr && addr + len >= v->addr + v->len){
+    fileclose(v->f);
+    v->used = 0;
+  } else if(addr == v->addr){
+    v->addr += len;
+    v->offset += len;
+    v->len -= len;
+  } else if(addr + len >= v->addr + v->len){
+    v->len = addr - v->addr;
+  }
+
+  return 0;
+}
+
 // Create a new process, copying the parent.
 // Sets up child kernel stack to return as if from fork() system call.
 int
@@ -284,6 +351,14 @@ kfork(void)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
+
+  // copy mmap'd regions
+  for(i = 0; i < NVMA; i++){
+    np->vmas[i] = p->vmas[i];
+    if(np->vmas[i].used)
+      filedup(np->vmas[i].f);
+  }
+  np->mmap_bottom = p->mmap_bottom;
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -327,6 +402,12 @@ kexit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  // Unmap mmap'd regions, writing back MAP_SHARED pages.
+  for(int i = 0; i < NVMA; i++){
+    if(p->vmas[i].used)
+      vmaunmap(p, p->vmas[i].addr, p->vmas[i].len);
+  }
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
